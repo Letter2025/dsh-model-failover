@@ -1,0 +1,44 @@
+# dsh-model-failover bundle patch: one plugin row over the profile root.
+#
+# The plugin decorates the agent loop's request routing:
+# - `agent/request-error` records failures whose code is in `tripCodes` into a
+#   two-level circuit breaker (a model circuit opens after
+#   `modelCircuitThreshold` failures inside `burstWindowMs`; a platform circuit
+#   opens when `platformCircuitThreshold` distinct models under one provider
+#   are open), then delegates through `next()` so the bundled `llm-retry`
+#   policy still owns per-request retries.
+# - `agent/request` routes the next request to the first healthy fallback when
+#   the primary route's circuit is open.
+#
+# Open model circuits are probed after `modelCooldownMs` with a tiny real
+# call; a successful probe closes the circuit, a failed one extends it.
+#
+# `fallbacks` is the field you must configure for real — point it at routes
+# your account can actually reach (a provider with a registered adapter). Every
+# other field has a safe default. Omit `fallbacks` to install the plugin inert:
+# it records failures but never switches routes.
+
+- insert:
+    - id: model-failover
+      name: 'dsh-model-failover'
+      config:
+        enabled: true
+        fallbacks:
+          - provider: deepseek
+            model: deepseek-chat
+        tripCodes:
+          - RATE_LIMIT
+          - SERVER
+          - TIMEOUT
+          - TRANSPORT
+          - QUOTA
+          - EMPTY_RESPONSE
+        modelCircuitThreshold: 2
+        modelCooldownMs: 60000
+        platformCircuitThreshold: 2
+        platformCooldownMs: 120000
+        burstWindowMs: 300000
+        enableProbe: true
+        probeMaxTokens: 8
+        stripReasoningEffort: true
+        notifyUser: true
