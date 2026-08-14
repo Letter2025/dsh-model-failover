@@ -1,5 +1,9 @@
 # dsh-model-failover
 
+[English](README.md) | [中文](README.zh.md)
+
+[![Awesome DSH Plugin](https://awesome-dsh-plugin.com/badge.svg)](https://awesome-dsh-plugin.com)
+
 Two-level model circuit breaker with failover for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). When a model (or a whole provider) starts failing repeatedly, the plugin opens a circuit and routes the next model request to a configured fallback — no core changes, installable with `dsh plugin`.
 
 ## What it does
