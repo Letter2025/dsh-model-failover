@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import type { LlmCallConfig, LlmFailure, StreamChunk } from '@deepseek-ai/dsh-llm'
+import type { SkillCandidate, SkillProvider } from '@deepseek-ai/dsh-skill'
 import { apply, Config } from '../src/index.ts'
 import type { ModelFailoverConfig } from '../src/types.ts'
 
@@ -36,8 +37,14 @@ interface Harness {
  * Fake-context harness: captures the two waterfall listeners the plugin
  * registers and drives them directly, with fake timers so probe scheduling and
  * cooldowns are deterministic. The fake `llm.stream` is the probe stream.
+ * `skillsMock` makes `ctx.get('skills')` resolve, exercising the bundled-skill
+ * registration path.
  */
-function harness(cfg: ModelFailoverConfig, probeStream: () => AsyncIterable<StreamChunk> = okStream): Harness {
+function harness(
+  cfg: ModelFailoverConfig,
+  probeStream: () => AsyncIterable<StreamChunk> = okStream,
+  skillsMock?: { registerProvider: (create: (control: never) => SkillProvider) => unknown },
+): Harness {
   vi.useFakeTimers()
   const listeners: Record<string, ((...args: never[]) => unknown)[]> = {}
   const emit = vi.fn()
@@ -53,6 +60,7 @@ function harness(cfg: ModelFailoverConfig, probeStream: () => AsyncIterable<Stre
       (listeners[event] ??= []).push(cb)
     },
     emit,
+    get: vi.fn(() => skillsMock),
     setTimeout: (callback: () => void, delay: number) => setTimeout(callback, delay) as unknown as number,
     clearTimeout: (handle: unknown) => clearTimeout(handle as ReturnType<typeof setTimeout>),
     effect: (callback: () => unknown) => callback(),
@@ -194,5 +202,28 @@ describe('dsh-model-failover probes', () => {
     expect(await h.request({ provider: 'mock', model: 'm1' })).toEqual({ provider: 'mock2', model: 'm2' })
     await h.advance(30_001) // past the cooldown: the circuit expired, primary is healthy again
     expect(await h.request({ provider: 'mock', model: 'm1' })).toEqual({ provider: 'mock', model: 'm1' })
+  })
+})
+
+describe('dsh-model-failover bundled skill', () => {
+  it('registers the guidance skill on ctx.skills when the service is present', async () => {
+    let provider: SkillProvider | undefined
+    const registerProvider = vi.fn((create: (control: never) => SkillProvider) => {
+      provider = create(undefined as never)
+      return vi.fn()
+    })
+    harness(config(), okStream, { registerProvider })
+    expect(registerProvider).toHaveBeenCalledTimes(1)
+
+    const listed = (await provider!.list({})) as readonly SkillCandidate[]
+    const candidate = listed[0]!
+    expect(candidate.name).toBe('configure-model-failover')
+    expect(candidate.description).toContain('备用模型')
+    expect(candidate.source).toBe('bundled')
+    expect(candidate.rank).toBe(600)
+
+    const definition = await provider!.get(candidate, {})
+    expect(definition?.content).toContain('# 配置 dsh-model-failover 备用模型')
+    expect(definition?.content).not.toContain('---') // frontmatter stripped
   })
 })

@@ -26,6 +26,15 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { createUserMessage, type LlmCallConfig } from '@deepseek-ai/dsh-llm'
+import { readFile } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
+import {
+  BUNDLED_SKILL_RANK,
+  type SkillCandidate,
+  type SkillDefinition,
+  type SkillProvider,
+  type SkillRegistry,
+} from '@deepseek-ai/dsh-skill'
 import { CircuitBreaker, modelKey } from './circuit.ts'
 import type { FailoverRoute, ModelFailoverConfig } from './types.ts'
 
@@ -57,6 +66,56 @@ function switchedConfig(base: LlmCallConfig, target: FailoverRoute, stripReasoni
   if (!stripReasoningEffort) return { ...base, provider: target.provider, model: target.model }
   const { reasoningEffort, ...rest } = base
   return { ...rest, provider: target.provider, model: target.model }
+}
+
+// --- bundled guidance skill -------------------------------------------------
+//
+// The package ships `skills/configure-model-failover/SKILL.md`. When the
+// `skills` service is present (the web and headless profiles ship it), the
+// plugin registers the skill through the official bundled-provider seam, so
+// installing the plugin makes the skill available with no extra copy step.
+// The service is optional: a profile without it still gets full failover, it
+// just has no bundled skill catalog entry.
+
+const SKILL_NAME = 'configure-model-failover'
+const SKILL_DESCRIPTION = '引导用户配置 dsh-model-failover 插件的备用模型（fallback）。当用户提到"配置备用模型、配置回退、fallback、模型熔断回退"或想修改 dsh-model-failover 的 fallbacks 时使用。流程：AI 先探测当前模型配置并写入配置，再请用户确认。'
+const SKILL_BODY_URL = new URL('../skills/configure-model-failover/SKILL.md', import.meta.url)
+const SKILL_DIR_PATH = fileURLToPath(new URL('../skills/configure-model-failover/', import.meta.url))
+
+/** Strip the YAML frontmatter block so only the instruction body reaches the model. */
+function stripFrontmatter(markdown: string): string {
+  if (!markdown.startsWith('---\n')) return markdown
+  const end = markdown.indexOf('\n---', 4)
+  if (end === -1) return markdown
+  return markdown.slice(end + 4).replace(/^\n+/, '')
+}
+
+/**
+ * Bundled skill provider: advertises a fixed candidate, loads the body lazily
+ * from the packaged SKILL.md. `BUNDLED_SKILL_RANK` keeps a user's own
+ * filesystem skill with the same name winning over this packaged one.
+ */
+function bundledSkillProvider(): SkillProvider {
+  const candidate: SkillCandidate = {
+    name: SKILL_NAME,
+    description: SKILL_DESCRIPTION,
+    invocation: { modelInvocable: true, userInvocable: true },
+    provider: 'dsh-model-failover',
+    source: 'bundled',
+    resourceBase: { kind: 'directory', path: SKILL_DIR_PATH },
+    rank: BUNDLED_SKILL_RANK,
+    locator: SKILL_BODY_URL,
+  }
+  return {
+    name: 'dsh-model-failover',
+    list: () => Promise.resolve([candidate]),
+    async get(): Promise<SkillDefinition | undefined> {
+      return {
+        ...candidate,
+        content: stripFrontmatter(await readFile(SKILL_BODY_URL, 'utf8')),
+      }
+    },
+  }
 }
 
 /**
@@ -221,6 +280,11 @@ export function apply(ctx: Context, rawConfig: ModelFailoverConfig): void {
     notifySwitch(ctx, payload.agent, primary, target, config.notifyUser)
     return switched
   })
+
+  // Register the bundled guidance skill when the skills service is present.
+  // Optional by design: a profile without `skills` still gets full failover.
+  const skills = ctx.get('skills') as SkillRegistry | undefined
+  if (skills) skills.registerProvider(() => bundledSkillProvider())
 
   ctx.effect(() => () => {
     lifetime.abort(new Error('dsh-model-failover plugin disposed'))
