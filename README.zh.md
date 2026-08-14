@@ -18,6 +18,8 @@ dsh plugin --profile web add dsh-model-failover
 
 然后按需在 profile 的 `cordis.patch.yml` 里配置 `fallbacks`（唯一必配项）和阈值——完整默认配置见 [cordis.patch.yml](cordis.patch.yml) 中的插件行。
 
+配套引导技能 `configure-model-failover`：由 AI 探测当前模型配置、写入 fallback 覆盖配置、再请你确认。把 `skills/configure-model-failover/SKILL.md` 复制到 `~/.dsh/skills/configure-model-failover/` 即可（用户级技能实时生效，无需重启）。
+
 ## 工作原理
 
 插件装饰两个 agent-loop 官方瀑布（均为官方扩展点，无核心改动）：

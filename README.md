@@ -18,6 +18,8 @@ dsh plugin --profile web add dsh-model-failover
 
 Then configure `fallbacks` (the only field you must set) and, if needed, the thresholds in your profile `cordis.patch.yml` — see the [plugin row in cordis.patch.yml](cordis.patch.yml) for the full default config.
 
+A companion skill, `configure-model-failover`, walks the agent through setting the fallback models (AI probes the current model config, writes the fallback override, then asks you to confirm). Copy `skills/configure-model-failover/SKILL.md` into `~/.dsh/skills/configure-model-failover/` — user-level skills are picked up live, no restart needed.
+
 ## How it works
 
 The plugin decorates two agent-loop waterfalls (both official extension points, no core changes):
