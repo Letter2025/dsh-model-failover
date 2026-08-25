@@ -7,8 +7,6 @@
 [![docs](https://img.shields.io/badge/docs-English%20%7C%20%E4%B8%AD%E6%96%87-0075cc?style=flat&labelColor=555555)](https://github.com/Letter2025/dsh-model-failover/blob/main/README.md)
 [![Awesome DSH Plugin](https://awesome-dsh-plugin.com/badge.svg)](https://awesome-dsh-plugin.com)
 
-[English](https://github.com/Letter2025/dsh-model-failover/blob/main/README.md) | 中文
-
 为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 打造的两级模型熔断与回退插件。当某个模型（或整个平台）持续失败时，插件打开熔断并把下一个模型请求路由到配置好的备用模型——零核心改动，`dsh plugin` 即可安装。
 
 ## 功能
