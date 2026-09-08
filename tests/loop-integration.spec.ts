@@ -5,9 +5,10 @@ import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import * as ModelFailover from '../src/index.ts'
 import type { ModelFailoverConfig } from '../src/types.ts'
-import { MockAdapter, textResponse } from '../../../packages/core/agent-loop/tests/mock-adapter.ts'
+import { MockAdapter, textResponse } from './support/mock-adapter.ts'
 
 function errorResponse(code: string, message: string): StreamChunk[] {
   return [{ type: 'finish', reason: { kind: 'error', failure: { message, code } } }]
@@ -17,6 +18,9 @@ function errorResponse(code: string, message: string): StreamChunk[] {
 async function harness(config: Partial<ModelFailoverConfig>): Promise<Context> {
   const ctx = new Context()
   await mountAgentLoopTestDependencies(ctx)
+  // 0.1.2 AgentLoop injects `sessionProjections`; mount the registry before
+  // the loop (the testkit mounts the loop's other prerequisites).
+  await ctx.plugin(SessionProjectionRegistry)
   await ctx.plugin(AgentLoop, { agents: [] })
   await ctx.plugin(ModelFailover, config as ModelFailoverConfig)
   return ctx
@@ -67,13 +71,14 @@ describe('dsh-model-failover agent-loop integration', () => {
     expect(fallback.requests).toHaveLength(1)
     expect(fallback.requests[0]).toMatchObject({ provider: 'mock2', model: 'm2' })
 
-    // The loop itself logged the actual (fallback) route...
-    const headers = [...agent.session.events].filter(event => event.type === 'request/header')
+    // The loop itself logged the actual (fallback) route... (dsh-session
+    // 0.1.2 exposes the log through snapshotEvents(), not a bare `events`.)
+    const headers = agent.session.snapshotEvents().filter(event => event.type === 'request/header')
     expect(headers.some(event =>
       event.data.header.config.provider === 'mock2' && event.data.header.config.model === 'm2',
     )).toBe(true)
     // ...and the plugin announced the switch as a user-visible message.
-    const notices = [...agent.session.events].filter((event): event is SessionEvent<'user/message'> =>
+    const notices = agent.session.snapshotEvents().filter((event): event is SessionEvent<'user/message'> =>
       event.type === 'user/message'
       && event.data.source.kind === 'plugin'
       && event.data.source.plugin === 'dsh-model-failover',
