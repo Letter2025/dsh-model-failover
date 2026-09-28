@@ -5,7 +5,6 @@ import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
-import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import * as ModelFailover from '../src/index.ts'
 import type { ModelFailoverConfig } from '../src/types.ts'
 import { MockAdapter, textResponse } from './support/mock-adapter.ts'
@@ -18,9 +17,8 @@ function errorResponse(code: string, message: string): StreamChunk[] {
 async function harness(config: Partial<ModelFailoverConfig>): Promise<Context> {
   const ctx = new Context()
   await mountAgentLoopTestDependencies(ctx)
-  // 0.1.2 AgentLoop injects `sessionProjections`; mount the registry before
-  // the loop (the testkit mounts the loop's other prerequisites).
-  await ctx.plugin(SessionProjectionRegistry)
+  // The 0.1.7 testkit already owns `sessionProjections`; mounting it again
+  // would be a duplicate registration.
   await ctx.plugin(AgentLoop, { agents: [] })
   await ctx.plugin(ModelFailover, config as ModelFailoverConfig)
   return ctx
@@ -54,7 +52,8 @@ describe('dsh-model-failover agent-loop integration', () => {
     const fallback = new MockAdapter([textResponse('done')])
     ctx.llm.registerAdapter(['mock'], primary)
     ctx.llm.registerAdapter(['mock2'], fallback)
-    const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'm1' })
+    // rc.2: AgentLoop.create is async; the published agent drives via followup.
+    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'm1' })
 
     const turn1 = waitForIdle(ctx, agent)
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
@@ -80,8 +79,7 @@ describe('dsh-model-failover agent-loop integration', () => {
     // ...and the plugin announced the switch as a user-visible message.
     const notices = agent.session.snapshotEvents().filter((event): event is SessionEvent<'user/message'> =>
       event.type === 'user/message'
-      && event.data.source.kind === 'plugin'
-      && event.data.source.plugin === 'dsh-model-failover',
+      && event.data.source.kind === 'model-selection',
     )
     expect(notices).toHaveLength(1)
   })

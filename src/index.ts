@@ -134,7 +134,9 @@ function notifySwitch(
   try {
     agent.session.append('user/message', createUserMessage({
       content: [{ type: 'text', text }],
-      source: { kind: 'plugin', plugin: 'dsh-model-failover' },
+      // dsh-llm 0.1.7 dropped the generic 'plugin' producer; the switch
+      // notice is owned by the model-selection domain.
+      source: { kind: 'model-selection' },
     }), { surfaceOp: 'append' })
   } catch (error) {
     ctx.logger.error(
@@ -186,7 +188,8 @@ export function apply(ctx: Context, rawConfig: ModelFailoverConfig): void {
         model,
         messages: [createUserMessage({
           content: [{ type: 'text', text: 'ping' }],
-          source: { kind: 'plugin', plugin: 'dsh-model-failover' },
+          // Probe traffic is an internal model-selection-domain message.
+          source: { kind: 'model-selection' },
         })],
         maxTokens: config.probeMaxTokens,
         signal: lifetime.signal,
