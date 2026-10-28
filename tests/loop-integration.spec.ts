@@ -52,7 +52,7 @@ describe('dsh-model-failover agent-loop integration', () => {
     const fallback = new MockAdapter([textResponse('done')])
     ctx.llm.registerAdapter(['mock'], primary)
     ctx.llm.registerAdapter(['mock2'], fallback)
-    // rc.2: AgentLoop.create is async; the published agent drives via followup.
+    // alpha2: AgentLoop.create is async; the published agent drives via followup.
     const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'm1' })
 
     const turn1 = waitForIdle(ctx, agent)

@@ -2,18 +2,9 @@
  * dsh-model-failover: two-level model circuit breaker with failover for the
  * DeepSeek Harness agent loop.
  *
- * The plugin decorates two agent-loop waterfalls:
- * - `agent/request-error` records each model-request failure whose code is in
- *   `tripCodes` into a two-level circuit breaker: a model circuit opens after
- *   `modelCircuitThreshold` failures inside `burstWindowMs`, and a platform
- *   circuit opens when `platformCircuitThreshold` distinct models under one
- *   provider are open. Recording always delegates through `next()`, so the
- *   bundled `llm-retry` policy still owns per-request retries; the breaker
- *   observes the failures that escape it.
- * - `agent/request` picks the route for the next request: the healthy primary
- *   route, or the first healthy fallback when the primary's circuit is open.
- *   The switch is recorded durably by the loop itself (`request/header` change
- *   with the actual provider/model), and optionally as a user-visible message.
+ * The plugin observes `agent/request-error` failures and routes around open model
+ * circuits. On hosts with durable Agent model selection, it records the next-step
+ * route before preparation; older hosts use the request waterfall as a fallback.
  *
  * Open model circuits are probed after their cooldown with a tiny real call;
  * a successful probe closes the circuit, a failed one extends the cooldown.
@@ -24,7 +15,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Agent, ModelSelection } from '@deepseek-ai/dsh-agent'
 import { createUserMessage, type LlmCallConfig } from '@deepseek-ai/dsh-llm'
 import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
@@ -146,9 +137,38 @@ function notifySwitch(
   }
 }
 
+type AgentModelApi = {
+  current(): Readonly<ModelSelection> | undefined
+  select(selection: Readonly<ModelSelection>): void
+}
+
+function agentModelApi(agent: Agent): AgentModelApi | undefined {
+  const candidate = (agent as unknown as { model?: unknown }).model
+  if (typeof candidate !== 'object' || candidate === null) return undefined
+  if (!('current' in candidate) || typeof candidate.current !== 'function') return undefined
+  if (!('select' in candidate) || typeof candidate.select !== 'function') return undefined
+  return candidate as unknown as AgentModelApi
+}
+
+function sameRoute(left: FailoverRoute, right: FailoverRoute): boolean {
+  return left.provider === right.provider && left.model === right.model
+}
+
+function selectAgentModel(agent: Agent, route: FailoverRoute, stripReasoningEffort: boolean): boolean {
+  const model = agentModelApi(agent)
+  if (model === undefined) return false
+  const current = model.current()
+  model.select({
+    ...route,
+    ...!stripReasoningEffort && current?.reasoningEffort !== undefined
+      ? { reasoningEffort: current.reasoningEffort }
+      : {},
+  })
+  return true
+}
 /**
- * Register the two waterfall decorators and probe scheduling.
- * @param ctx - context exposing the LLM service and agent-loop waterfalls.
+ * Register model routing and probe lifecycle hooks.
+ * @param ctx - context exposing the LLM service and Agent lifecycle.
  * @param rawConfig - untrusted plugin configuration, validated by the schema.
  */
 export function apply(ctx: Context, rawConfig: ModelFailoverConfig): void {
@@ -161,6 +181,9 @@ export function apply(ctx: Context, rawConfig: ModelFailoverConfig): void {
     burstWindowMs: config.burstWindowMs,
   })
   const lastRoute = new WeakMap<Agent, FailoverRoute>()
+  const primaryRoutes = new WeakMap<Agent, FailoverRoute>()
+  const selectedByFailover = new WeakMap<Agent, FailoverRoute>()
+  const observedSelections = new WeakMap<Agent, FailoverRoute>()
   const probeTimers = new Map<string, ReturnType<typeof setTimeout>>()
   const lifetime = new AbortController()
 
@@ -221,6 +244,27 @@ export function apply(ctx: Context, rawConfig: ModelFailoverConfig): void {
     }
   }
 
+  ctx.on('agent/pre-step', async ({ agent, modelSelection }, next) => {
+    if (modelSelection === undefined || agentModelApi(agent) === undefined) return next()
+    const current: FailoverRoute = { provider: modelSelection.provider, model: modelSelection.model }
+    const observed = observedSelections.get(agent)
+    const priorFailover = selectedByFailover.get(agent)
+    if (!primaryRoutes.has(agent)) primaryRoutes.set(agent, current)
+    else if (observed !== undefined && !sameRoute(current, observed)
+      && (priorFailover === undefined || !sameRoute(current, priorFailover))) {
+      primaryRoutes.set(agent, current)
+      selectedByFailover.delete(agent)
+    }
+    observedSelections.set(agent, current)
+    const primary = primaryRoutes.get(agent) ?? current
+    const target = breaker.routeFor(primary, config.fallbacks)
+    if (!sameRoute(target, current) && selectAgentModel(agent, target, config.stripReasoningEffort)) {
+      selectedByFailover.set(agent, target)
+      ctx.emit('model-failover/failover', { from: current, to: target, agentId: agent.id })
+      notifySwitch(ctx, agent, current, target, config.notifyUser)
+    }
+    return next()
+  })
   ctx.on('agent/request-error', async (
     payload: {
       agent: Agent
@@ -257,6 +301,13 @@ export function apply(ctx: Context, rawConfig: ModelFailoverConfig): void {
         payload.failure.code,
       )
     }
+    const primary = primaryRoutes.get(payload.agent) ?? route
+    const target = breaker.routeFor(primary, config.fallbacks)
+    if (!sameRoute(target, route) && selectAgentModel(payload.agent, target, config.stripReasoningEffort)) {
+      selectedByFailover.set(payload.agent, target)
+      ctx.emit('model-failover/failover', { from: route, to: target, agentId: payload.agent.id })
+      notifySwitch(ctx, payload.agent, route, target, config.notifyUser)
+    }
     return next()
   })
 
@@ -266,21 +317,33 @@ export function apply(ctx: Context, rawConfig: ModelFailoverConfig): void {
   ): Promise<LlmCallConfig> => {
     if (!config.enabled) return next()
     const base = await next()
-    const primary: FailoverRoute = { provider: base.provider, model: base.model }
+    const current: FailoverRoute = { provider: base.provider, model: base.model }
+    if (!primaryRoutes.has(payload.agent)) primaryRoutes.set(payload.agent, current)
+    const primary = primaryRoutes.get(payload.agent) ?? current
     const target = breaker.routeFor(primary, config.fallbacks)
-    lastRoute.set(payload.agent, target)
-    if (target.provider === base.provider && target.model === base.model) return base
+    // Failures are recorded against the route the request actually used, so an
+    // open fallback circuit is what sends the next request back to the primary.
+    const effective = sameRoute(target, current) ? current : target
+    lastRoute.set(payload.agent, effective)
+    if (sameRoute(effective, current)) return base
+    if (agentModelApi(payload.agent) !== undefined) {
+      if (!sameRoute(selectedByFailover.get(payload.agent) ?? current, target)) {
+        selectAgentModel(payload.agent, target, config.stripReasoningEffort)
+        selectedByFailover.set(payload.agent, target)
+      }
+      return base
+    }
     const switched = switchedConfig(base, target, config.stripReasoningEffort)
-    ctx.emit('model-failover/failover', { from: primary, to: target, agentId: payload.agent.id })
+    ctx.emit('model-failover/failover', { from: current, to: target, agentId: payload.agent.id })
     ctx.logger.warn(
       '[dsh-model-failover] %s: %s/%s unavailable, switching to %s/%s',
       payload.agent.id,
-      primary.provider,
-      primary.model,
+      current.provider,
+      current.model,
       target.provider,
       target.model,
     )
-    notifySwitch(ctx, payload.agent, primary, target, config.notifyUser)
+    notifySwitch(ctx, payload.agent, current, target, config.notifyUser)
     return switched
   })
 
